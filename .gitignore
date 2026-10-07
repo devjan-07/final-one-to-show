@@ -1,0 +1,20 @@
+# Ignore Spring Boot application properties (contains secrets / local config)
+**/application.properties
+**/node_modules
+**/target
+.idea/
+**/.m2
+**/.env
+
+# Maven
+target/
+
+# Node
+node_modules/
+
+# Environment variables
+.env
+
+# IntelliJ
+.idea/
+*.iml
