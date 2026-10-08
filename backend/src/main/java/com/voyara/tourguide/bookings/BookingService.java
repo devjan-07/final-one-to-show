@@ -15,6 +15,8 @@ import com.voyara.tourguide.users.AppUser;
 import com.voyara.tourguide.users.AppUserRepository;
 import com.voyara.tourguide.vehiclerental.Vehicle;
 import com.voyara.tourguide.vehiclerental.VehicleRepository;
+import com.voyara.tourguide.bookings.strategy.BookingStrategy;
+import com.voyara.tourguide.bookings.strategy.BookingStrategyFactory;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
@@ -38,6 +40,7 @@ public class BookingService {
     private final ReviewRepository reviewRepository;
     private final ReviewRatingService reviewRatingService;
     private final NotificationService notificationService;
+    private final BookingStrategyFactory bookingStrategyFactory;
 
     public BookingService(
             BookingRepository repository,
@@ -49,7 +52,8 @@ public class BookingService {
             PaymentRepository paymentRepository,
             ReviewRepository reviewRepository,
             ReviewRatingService reviewRatingService,
-            NotificationService notificationService
+            NotificationService notificationService,
+            BookingStrategyFactory bookingStrategyFactory
     ) {
         this.repository = repository;
         this.userRepository = userRepository;
@@ -61,6 +65,7 @@ public class BookingService {
         this.reviewRepository = reviewRepository;
         this.reviewRatingService = reviewRatingService;
         this.notificationService = notificationService;
+        this.bookingStrategyFactory = bookingStrategyFactory;
     }
 
     public List<Booking> findAll() {
@@ -406,36 +411,43 @@ public class BookingService {
         if (!candidate.getCheckOut().isAfter(candidate.getCheckIn())) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Check-out date must be after check-in date");
         }
+
         validateBookingType(candidate.getBookingType());
         if ("Cancelled".equalsIgnoreCase(candidate.getStatus())) {
             return;
         }
+
         validateLinkedResourceSelection(candidate.getGuideSelectionType(), candidate.getGuideId(), "guide");
         validateLinkedResourceSelection(candidate.getAccommodationSelectionType(), candidate.getAccommodationId(), "accommodation");
         validateLinkedResourceSelection(candidate.getVehicleSelectionType(), candidate.getVehicleId(), "vehicle");
 
         int days = bookingDays(candidate);
-        BigDecimal total = BigDecimal.ZERO;
-        boolean pricedFromResources = false;
-
-        TourPackage tourPackage = selectedPackage(candidate);
-        if (tourPackage != null) {
-            validateActive("Package", tourPackage.getStatus(), "Active");
-            if (tourPackage.getMaxGroup() > 0 && candidate.getGuests() > tourPackage.getMaxGroup()) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                        "Guest count exceeds the selected package maximum group size");
-            }
-            candidate.setPkg(tourPackage.getName());
-            if (candidate.getDestination() == null || candidate.getDestination().isBlank()) {
-                candidate.setDestination(String.join(", ", tourPackage.getDestinations()));
-            }
-            total = total.add(nonNull(tourPackage.getPrice()).multiply(BigDecimal.valueOf(candidate.getGuests())));
-            pricedFromResources = true;
-        } else if (strictCustomerBooking && "PACKAGE".equalsIgnoreCase(candidate.getBookingType())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "A package booking requires a valid package");
+        BookingStrategy strategy = bookingStrategyFactory.getStrategy(candidate.getBookingType());
+        if (strategy == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported booking type");
         }
-        if (strictCustomerBooking && "CUSTOM".equalsIgnoreCase(candidate.getBookingType())) {
-            requireText(candidate.getDestination(), "Destination is required");
+
+        BigDecimal total = strategy.validateAndCalculate(
+                candidate, updatingId, strictCustomerBooking, days);
+        boolean pricedFromResources = total.signum() > 0;
+
+        // Strategy handles the main resource for the selected booking type.
+        // Other resources remain optional add-ons and keep the existing pricing rules.
+        if (!"PACKAGE".equalsIgnoreCase(candidate.getBookingType())) {
+            TourPackage tourPackage = selectedPackage(candidate);
+            if (tourPackage != null) {
+                validateActive("Package", tourPackage.getStatus(), "Active");
+                if (tourPackage.getMaxGroup() > 0 && candidate.getGuests() > tourPackage.getMaxGroup()) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Guest count exceeds the selected package maximum group size");
+                }
+                candidate.setPkg(tourPackage.getName());
+                if (candidate.getDestination() == null || candidate.getDestination().isBlank()) {
+                    candidate.setDestination(String.join(", ", tourPackage.getDestinations()));
+                }
+                total = total.add(nonNull(tourPackage.getPrice()).multiply(BigDecimal.valueOf(candidate.getGuests())));
+                pricedFromResources = true;
+            }
         }
 
         TourGuide guide = selectedGuide(candidate);
@@ -446,66 +458,57 @@ public class BookingService {
             pricedFromResources = true;
         }
 
-        Accommodation accommodation = selectedAccommodation(candidate);
-        if (accommodation != null) {
-            validateActive("Accommodation", accommodation.getStatus(), "Active");
-            if (strictCustomerBooking && "ACCOMMODATION".equalsIgnoreCase(candidate.getBookingType())) {
-                requireText(candidate.getRoomType(), "Room type is required");
+        if (!"ACCOMMODATION".equalsIgnoreCase(candidate.getBookingType())) {
+            Accommodation accommodation = selectedAccommodation(candidate);
+            if (accommodation != null) {
+                validateActive("Accommodation", accommodation.getStatus(), "Active");
+                int requestedRooms = bookingRooms(candidate);
+                int availableRooms = availableAccommodationRooms(accommodation);
+                if (requestedRooms > availableRooms) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Requested rooms exceed available rooms at this accommodation");
+                }
+                int maxGuestsForRooms = roomTypeCapacity(candidate.getRoomType()) * requestedRooms;
+                if (candidate.getGuests() > maxGuestsForRooms) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Guest count exceeds selected room capacity");
+                }
+                int bookedRooms = bookedAccommodationRooms(candidate, updatingId);
+                if (bookedRooms + requestedRooms > availableRooms) {
+                    throw new ResponseStatusException(HttpStatus.CONFLICT,
+                            "The selected accommodation does not have enough rooms for these dates");
+                }
+                candidate.setAccommodation(accommodation.getName());
+                total = total.add(nonNull(accommodation.getPrice())
+                        .multiply(BigDecimal.valueOf(days))
+                        .multiply(BigDecimal.valueOf(requestedRooms)));
+                pricedFromResources = true;
             }
-            int requestedRooms = bookingRooms(candidate);
-            int availableRooms = availableAccommodationRooms(accommodation);
-            if (requestedRooms > availableRooms) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Requested rooms exceed available rooms at this accommodation");
-            }
-            int maxGuestsForRooms = roomTypeCapacity(candidate.getRoomType()) * requestedRooms;
-            if (candidate.getGuests() > maxGuestsForRooms) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Guest count exceeds selected room capacity");
-            }
-            int bookedRooms = bookedAccommodationRooms(candidate, updatingId);
-            if (bookedRooms + requestedRooms > availableRooms) {
-                throw new ResponseStatusException(HttpStatus.CONFLICT, "The selected accommodation does not have enough rooms for these dates");
-            }
-            candidate.setAccommodation(accommodation.getName());
-            total = total.add(nonNull(accommodation.getPrice()).multiply(BigDecimal.valueOf(days)).multiply(BigDecimal.valueOf(requestedRooms)));
-            pricedFromResources = true;
-        } else if (strictCustomerBooking && "ACCOMMODATION".equalsIgnoreCase(candidate.getBookingType())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "An accommodation booking requires a valid accommodation");
         }
 
-        Vehicle vehicle = selectedVehicle(candidate);
-        if (vehicle != null) {
-            validateActive("Vehicle", vehicle.getStatus(), "Available");
-            if (candidate.getGuests() > vehicle.getCapacity()) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Passenger count exceeds the selected vehicle capacity");
-            }
-            if (candidate.getLuggageCount() > vehicle.getLuggageCapacity()) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Luggage count exceeds the selected vehicle capacity");
-            }
-            candidate.setVehicle(label(vehicle.getName(), vehicle.getBrand(), vehicle.getModel()));
-            if ("VEHICLE".equalsIgnoreCase(candidate.getBookingType())) {
-                candidate.setDestination(candidate.getPickupLocation());
-            }
-            total = total.add(nonNull(vehicle.getPricePerDay()).multiply(BigDecimal.valueOf(days)));
-            pricedFromResources = true;
-        } else if (strictCustomerBooking && "VEHICLE".equalsIgnoreCase(candidate.getBookingType())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "A vehicle booking requires a valid vehicle");
-        }
-        if (strictCustomerBooking && vehicle != null && (candidate.getPickupLocation() == null || candidate.getPickupLocation().isBlank())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Pickup location is required");
-        }
-        if (strictCustomerBooking && vehicle != null) {
-            requireText(candidate.getPickupTime(), "Pickup time is required");
-            requireText(candidate.getReturnLocation(), "Return location is required");
-            requireText(candidate.getReturnTime(), "Return time is required");
-        }
+        if (!"VEHICLE".equalsIgnoreCase(candidate.getBookingType())) {
+            Vehicle vehicle = selectedVehicle(candidate);
+            if (vehicle != null) {
+                validateActive("Vehicle", vehicle.getStatus(), "Available");
+                if (candidate.getGuests() > vehicle.getCapacity()) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Passenger count exceeds the selected vehicle capacity");
+                }
+                if (candidate.getLuggageCount() > vehicle.getLuggageCapacity()) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                            "Luggage count exceeds the selected vehicle capacity");
+                }
+                candidate.setVehicle(label(vehicle.getName(), vehicle.getBrand(), vehicle.getModel()));
+                total = total.add(nonNull(vehicle.getPricePerDay()).multiply(BigDecimal.valueOf(days)));
+                pricedFromResources = true;
 
-        if (strictCustomerBooking && "VEHICLE".equalsIgnoreCase(candidate.getBookingType()) && (candidate.getPickupLocation() == null || candidate.getPickupLocation().isBlank())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Pickup location is required");
-        }
-        if (strictCustomerBooking && "VEHICLE".equalsIgnoreCase(candidate.getBookingType())) {
-            requireText(candidate.getPickupTime(), "Pickup time is required");
-            requireText(candidate.getReturnLocation(), "Return location is required");
-            requireText(candidate.getReturnTime(), "Return time is required");
+                if (strictCustomerBooking) {
+                    requireText(candidate.getPickupLocation(), "Pickup location is required");
+                    requireText(candidate.getPickupTime(), "Pickup time is required");
+                    requireText(candidate.getReturnLocation(), "Return location is required");
+                    requireText(candidate.getReturnTime(), "Return time is required");
+                }
+            }
         }
 
         List<Booking> existingBookings = repository.findOverlapping(candidate.getCheckIn(), candidate.getCheckOut());
@@ -526,8 +529,7 @@ public class BookingService {
             String message = "VEHICLE".equalsIgnoreCase(candidate.getBookingType())
                     ? "The selected vehicle is unavailable for these dates"
                     : "One of the selected guide or vehicle is unavailable for these dates";
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    message);
+            throw new ResponseStatusException(HttpStatus.CONFLICT, message);
         }
 
         if (strictCustomerBooking || pricedFromResources) {
