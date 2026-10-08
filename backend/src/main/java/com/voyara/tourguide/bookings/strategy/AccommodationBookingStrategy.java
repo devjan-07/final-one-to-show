@@ -3,6 +3,7 @@ package com.voyara.tourguide.bookings.strategy;
 import com.voyara.tourguide.accommodations.Accommodation;
 import com.voyara.tourguide.accommodations.AccommodationRepository;
 import com.voyara.tourguide.bookings.Booking;
+import com.voyara.tourguide.bookings.BookingRepository;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.Objects;
@@ -13,9 +14,14 @@ import org.springframework.web.server.ResponseStatusException;
 @Component
 public class AccommodationBookingStrategy implements BookingStrategy {
     private final AccommodationRepository accommodationRepository;
+    private final BookingRepository bookingRepository;
 
-    public AccommodationBookingStrategy(AccommodationRepository accommodationRepository) {
+    public AccommodationBookingStrategy(
+            AccommodationRepository accommodationRepository,
+            BookingRepository bookingRepository
+    ) {
         this.accommodationRepository = accommodationRepository;
+        this.bookingRepository = bookingRepository;
     }
 
     @Override
@@ -91,14 +97,30 @@ public class AccommodationBookingStrategy implements BookingStrategy {
     private int bookedAccommodationRooms(Booking candidate, String updatingId) {
         java.util.TreeMap<LocalDate, Integer> changes = new java.util.TreeMap<>();
 
-        // This strategy owns accommodation-specific availability checking.
-        // Existing bookings are read through the repository used by the service.
-        accommodationRepository.findLockedById(candidate.getAccommodationId()).ifPresent(a -> {
-            // No-op: the actual overlap calculation is performed below through the
-            // booking repository injected by the service in the integrated path.
-        });
+        bookingRepository.findOverlapping(candidate.getCheckIn(), candidate.getCheckOut()).stream()
+                .filter(existing -> !Objects.equals(existing.getId(), updatingId))
+                .filter(existing -> Objects.equals(candidate.getAccommodationId(), existing.getAccommodationId()))
+                .filter(existing -> !"OWN".equalsIgnoreCase(existing.getAccommodationSelectionType()))
+                .forEach(existing -> {
+                    LocalDate start = existing.getCheckIn().isBefore(candidate.getCheckIn())
+                            ? candidate.getCheckIn() : existing.getCheckIn();
+                    LocalDate end = existing.getCheckOut().isAfter(candidate.getCheckOut())
+                            ? candidate.getCheckOut() : existing.getCheckOut();
+                    changes.merge(start, bookingRooms(existing), Integer::sum);
+                    changes.merge(end, -bookingRooms(existing), Integer::sum);
+                });
 
-        return 0;
+        int current = 0;
+        int peak = 0;
+        for (int delta : changes.values()) {
+            current += delta;
+            peak = Math.max(peak, current);
+        }
+        return peak;
+    }
+
+    private int bookingRooms(Booking booking) {
+        return booking.getRooms() == null ? 1 : Math.max(1, booking.getRooms());
     }
 
     private int roomTypeCapacity(String roomType) {
