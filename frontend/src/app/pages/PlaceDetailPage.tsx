@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { ArrowLeft, CalendarDays, CheckCircle, Clock, CreditCard, HelpCircle, MapPin, ShieldCheck, Tag, Users } from "lucide-react";
+import { ArrowLeft, CalendarDays, CheckCircle, Clock, CloudRain, CloudSun, CreditCard, HelpCircle, MapPin, ShieldCheck, Sun, Tag, Thermometer, Umbrella, Users } from "lucide-react";
 import { Navbar } from "../components/Navbar";
 import { Footer } from "../components/Footer";
 import { useAuth } from "../context/AuthContext";
 import { destinationsApi, packagesApi, type Destination, type TourPackage } from "../lib/api";
+import { destinationsWeatherApi, type WeatherForecast } from "../lib/weatherApi";
 
 type DetailMode = "destination" | "package";
 
@@ -27,6 +28,9 @@ function PlaceDetailPage({ mode }: { mode: DetailMode }) {
   const [item, setItem] = useState<DetailItem | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [weather, setWeather] = useState<WeatherForecast | null>(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherError, setWeatherError] = useState("");
   const isTourist = isAuthenticated && user?.roles.includes("TOURIST");
 
   useEffect(() => {
@@ -60,6 +64,37 @@ function PlaceDetailPage({ mode }: { mode: DetailMode }) {
       cancelled = true;
     };
   }, [id, mode]);
+
+  useEffect(() => {
+    if (mode !== "destination" || item?.mode !== "destination") {
+      setWeather(null);
+      setWeatherError("");
+      setWeatherLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setWeather(null);
+    setWeatherError("");
+    setWeatherLoading(true);
+
+    destinationsWeatherApi.get(item.data.id)
+      .then((forecast) => {
+        if (!cancelled) setWeather(forecast);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setWeatherError(err instanceof Error ? err.message : "The weather forecast could not be loaded.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setWeatherLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [id, item, mode]);
 
   const detail = useMemo(() => item ? toDetail(item) : null, [item]);
   const bookingPath = detail && item?.mode === "package"
@@ -129,6 +164,80 @@ function PlaceDetailPage({ mode }: { mode: DetailMode }) {
 
                 <h2 className="text-xl font-bold text-gray-900">About this experience</h2>
                 <p className="mt-3 max-w-3xl text-sm leading-7 text-gray-600">{detail.description}</p>
+
+                {item?.mode === "destination" && (
+                  <section className="mt-8 rounded-2xl border border-sky-100 bg-sky-50/70 p-5 md:p-6" aria-labelledby="weather-heading">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <h2 id="weather-heading" className="text-xl font-bold text-gray-900">Weather forecast</h2>
+                        <p className="mt-1 text-sm text-gray-500">Current conditions and the next seven days</p>
+                      </div>
+                      {weather && <span className="text-xs text-gray-400">Source: {weather.source}</span>}
+                    </div>
+
+                    {weatherLoading && (
+                      <p className="mt-5 rounded-xl bg-white/80 p-4 text-sm text-gray-500" role="status">
+                        Loading local weather forecast...
+                      </p>
+                    )}
+
+                    {!weatherLoading && weatherError && (
+                      <div className="mt-5 rounded-xl border border-amber-100 bg-white p-4" role="status">
+                        <p className="text-sm font-semibold text-gray-800">Weather forecast is temporarily unavailable</p>
+                        <p className="mt-1 text-sm text-gray-500">{weatherError}</p>
+                      </div>
+                    )}
+
+                    {!weatherLoading && !weatherError && weather && (
+                      <>
+                        <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          <div className="flex items-center gap-4 rounded-xl bg-white p-4">
+                            {(() => {
+                              const Icon = weatherIconFor(weather.currentCondition);
+                              return <Icon className="h-10 w-10 shrink-0 text-sky-600" aria-hidden="true" />;
+                            })()}
+                            <div>
+                              <p className="text-sm font-semibold text-gray-700">{weather.currentCondition}</p>
+                              <p className="text-3xl font-extrabold text-gray-900">{Math.round(weather.currentTemperatureC)}°C</p>
+                              <p className="text-xs text-gray-500">{weather.location}</p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3 rounded-xl bg-white p-4">
+                            <Thermometer className="h-8 w-8 shrink-0 text-rose-500" aria-hidden="true" />
+                            <div>
+                              <p className="text-sm font-semibold text-gray-700">Plan for the weather</p>
+                              <p className="mt-1 text-xs leading-5 text-gray-500">
+                                Check daily rain probability, temperatures, sunrise and sunset before travelling.
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-7">
+                          {weather.forecast.map((day) => {
+                            const Icon = weatherIconFor(day.condition);
+                            return (
+                              <div key={day.date} className="rounded-xl bg-white p-3">
+                                <p className="text-xs font-bold text-gray-600">
+                                  {new Date(`${day.date}T12:00:00`).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}
+                                </p>
+                                <Icon className="mt-3 h-7 w-7 text-sky-600" aria-hidden="true" />
+                                <p className="mt-2 text-sm font-bold text-gray-900">
+                                  {Math.round(day.maximumTemperatureC)}° <span className="font-medium text-gray-400">/ {Math.round(day.minimumTemperatureC)}°</span>
+                                </p>
+                                <p className="mt-2 flex items-center gap-1 text-xs text-gray-500">
+                                  <Umbrella className="h-3.5 w-3.5 shrink-0" aria-hidden="true" /> {day.precipitationProbability}% rain
+                                </p>
+                                <p className="mt-2 text-[11px] leading-4 text-gray-400">Sunrise {formatTime(day.sunrise)}</p>
+                                <p className="text-[11px] leading-4 text-gray-400">Sunset {formatTime(day.sunset)}</p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </section>
+                )}
 
                 {detail.included.length > 0 && (
                   <div className="mt-8">
@@ -209,6 +318,23 @@ function PlaceDetailPage({ mode }: { mode: DetailMode }) {
       <Footer />
     </div>
   );
+}
+
+function weatherIconFor(condition: string) {
+  const normalized = condition.toLowerCase();
+  if (normalized.includes("rain") || normalized.includes("drizzle") || normalized.includes("thunderstorm")) {
+    return CloudRain;
+  }
+  if (normalized.includes("clear") || normalized === "mainly clear") {
+    return Sun;
+  }
+  return CloudSun;
+}
+
+function formatTime(value: string) {
+  if (!value) return "--:--";
+  const match = value.match(/T(\d{2}:\d{2})/);
+  return match?.[1] ?? value;
 }
 
 function toDetail(item: DetailItem) {
