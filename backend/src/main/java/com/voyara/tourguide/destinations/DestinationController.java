@@ -15,9 +15,11 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/destinations")
 public class DestinationController {
     private final DestinationService service;
+    private final WeatherService weatherService;
 
-    public DestinationController(DestinationService service) {
+    public DestinationController(DestinationService service, WeatherService weatherService) {
         this.service = service;
+        this.weatherService = weatherService;
     }
 
     @GetMapping
@@ -28,6 +30,11 @@ public class DestinationController {
     @GetMapping("/{id}")
     public Destination one(@PathVariable Long id) {
         return service.findById(id);
+    }
+
+    @GetMapping("/{id}/weather")
+    public WeatherForecast weather(@PathVariable Long id) {
+        return weatherService.forecastForDestination(id);
     }
 
     @PostMapping
